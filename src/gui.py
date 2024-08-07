@@ -5,12 +5,10 @@ from tkinter.scrolledtext import ScrolledText
 from typing import List
 import threading
 import queue
-from src.file_node import FileNode
+from concurrent.futures import ThreadPoolExecutor
 from src.file_utils import scan_directory, is_code_file, extract_pdf_content
 from src.logger import logger
-import base64
-import random
-
+import io
 
 class CodeExtractorGUI:
     def __init__(self, root):
@@ -323,37 +321,43 @@ class CodeExtractorGUI:
     def extract_files(self, selected_items: List[str], output_file: str):
         try:
             total_items = len(selected_items)
-            with open(output_file, "w", encoding="utf-8") as out_file:
-                for index, item_path in enumerate(selected_items, 1):
-                    relative_path = os.path.relpath(item_path, self.root_path)
-                    if os.path.isfile(item_path):
-                        out_file.write(f"File: {relative_path}\n")
-                        out_file.write("-" * 80 + "\n")
-                        if is_code_file(item_path):
-                            if item_path.lower().endswith(".pdf"):
-                                content = extract_pdf_content(item_path)
-                                out_file.write(content)
-                            else:
-                                try:
-                                    with open(
-                                        item_path, "r", encoding="utf-8"
-                                    ) as code_file:
-                                        content = code_file.read()
-                                        out_file.write(content)
-                                except UnicodeDecodeError:
-                                    out_file.write(
-                                        "Unable to read file: encoding error\n"
-                                    )
-                                except Exception as e:
-                                    out_file.write(f"Error reading file: {str(e)}\n")
+            buffer = io.StringIO()
+            
+            def process_file(item_path):
+                relative_path = os.path.relpath(item_path, self.root_path)
+                content = ""
+                if os.path.isfile(item_path):
+                    content += f"File: {relative_path}\n"
+                    content += "-" * 80 + "\n"
+                    if is_code_file(item_path):
+                        if item_path.lower().endswith(".pdf"):
+                            content += extract_pdf_content(item_path)
                         else:
-                            out_file.write("Non-code file (content not extracted)\n")
-                        out_file.write("\n\n")
+                            try:
+                                with open(item_path, "r", encoding="utf-8") as code_file:
+                                    content += code_file.read()
+                            except UnicodeDecodeError:
+                                content += "Unable to read file: encoding error\n"
+                            except Exception as e:
+                                content += f"Error reading file: {str(e)}\n"
                     else:
-                        out_file.write(f"Directory: {relative_path}\n")
-                        out_file.write("-" * 80 + "\n\n")
-                    progress = int((index / total_items) * 100)
+                        content += "Non-code file (content not extracted)\n"
+                    content += "\n\n"
+                else:
+                    content += f"Directory: {relative_path}\n"
+                    content += "-" * 80 + "\n\n"
+                return content
+
+            with ThreadPoolExecutor(max_workers=os.cpu_count()) as executor:
+                futures = [executor.submit(process_file, item_path) for item_path in selected_items]
+                for i, future in enumerate(futures):
+                    buffer.write(future.result())
+                    progress = int(((i + 1) / total_items) * 100)
                     self.queue.put(("update_progress", progress))
+
+            with open(output_file, "w", encoding="utf-8") as out_file:
+                out_file.write(buffer.getvalue())
+
             self.queue.put(("extraction_complete", output_file))
         except Exception as e:
             self.queue.put(("extraction_error", str(e)))
@@ -372,9 +376,7 @@ class CodeExtractorGUI:
         if os.path.isfile(file_path):
             try:
                 if file_path.lower().endswith(".pdf"):
-                    content = extract_pdf_content(file_path)[
-                        :4000
-                    ]  # First 4000 characters
+                    content = extract_pdf_content(file_path)[:4000]  # First 4000 characters
                     self.preview_text.insert(tk.END, content)
                     if len(content) == 4000:
                         self.preview_text.insert(tk.END, "\n\n[File truncated...]")
@@ -389,9 +391,7 @@ class CodeExtractorGUI:
             except Exception as e:
                 self.preview_text.insert(tk.END, f"Error previewing file: {str(e)}")
         elif os.path.isdir(file_path):
-            self.preview_text.insert(
-                tk.END, f"Selected item is a directory: {file_path}"
-            )
+            self.preview_text.insert(tk.END, f"Selected item is a directory: {file_path}")
         else:
             self.preview_text.insert(tk.END, f"Item not found: {file_path}")
 
@@ -415,6 +415,7 @@ class CodeExtractorGUI:
 
         root_item = self.tree.get_children()[0]
         search_recursive(root_item)
+
 
     def process_queue(self):
         try:
